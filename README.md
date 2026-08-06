@@ -28,3 +28,10 @@ git clone https://github.com/james5618/dwmblocks.git
 cd dwmblocks
 sudo make install
 ```
+
+## Licence
+
+GPLv2, see [LICENSE](LICENSE). The copyright notice lives here rather than in
+that file because the GPL text is meant to be passed on verbatim.
+
+© 2026 james5618 <james@josullivan.co.uk>
