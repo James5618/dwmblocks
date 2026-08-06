@@ -10,6 +10,9 @@
 #include <poll.h>
 #define LENGTH(X) (sizeof(X) / sizeof (X[0]))
 #define CMDLENGTH		50
+/* Room for every block at its full length, so getstatus() cannot run off the
+ * end no matter how much the commands print or how many blocks are enabled. */
+#define STATUSLENGTH		(LENGTH(blocks) * CMDLENGTH + 1)
 
 typedef struct {
 	char* icon;
@@ -36,7 +39,7 @@ static Display *dpy;
 static int screen;
 static Window root;
 static char statusbar[LENGTH(blocks)][CMDLENGTH] = {0};
-static char statusstr[2][256];
+static char statusstr[2][STATUSLENGTH];
 static int statusContinue = 1;
 static int signalFD;
 static int timerInterval = -1;
@@ -107,16 +110,16 @@ void getcmd(const Block *block, char *output)
         // a block that never produces output makes the process unkillable.
     } while (!s && e == EINTR && statusContinue);
 	pclose(cmdf);
-	int i = strlen(block->icon);
-	strcpy(output, block->icon);
-    strcpy(output+i, tmpstr);
+	// output points into a CMDLENGTH slot, one byte in when a signal byte was
+	// written. The old code assumed an empty icon: with any icon set, copying
+	// icon+value+delim ran past the slot into the next block's.
+	size_t avail = CMDLENGTH - (block->signal ? 1 : 0);
+	snprintf(output, avail, "%s%s", block->icon, tmpstr);
 	remove_all(output, '\n');
-	i = strlen(output);
+	size_t i = strlen(output);
     if ((i > 0 && block != &blocks[LENGTH(blocks) - 1])){
-        strcat(output, delim);
+        strncat(output, delim, avail - i - 1);
     }
-    i+=strlen(delim);
-	output[i++] = '\0';
 }
 
 void getcmds(int time)
@@ -169,14 +172,22 @@ void setupsignals()
 
 int getstatus(char *str, char *last)
 {
+	size_t len;
+
 	strcpy(last, str);
 	str[0] = '\0';
     for(int i = 0; i < LENGTH(blocks); i++) {
-		strcat(str, statusbar[i]);
-        if (i == LENGTH(blocks) - 1)
-            strcat(str, " ");
+		// Bounded: str holds STATUSLENGTH bytes. Unbounded strcat here used to
+		// be sized for a 256-byte buffer that the blocks could outgrow.
+		len = strlen(str);
+		strncat(str, statusbar[i], STATUSLENGTH - len - 1);
+        if (i == LENGTH(blocks) - 1) {
+			len = strlen(str);
+			strncat(str, " ", STATUSLENGTH - len - 1);
+		}
     }
-	str[strlen(str)-1] = '\0';
+	if ((len = strlen(str)) > 0)
+		str[len-1] = '\0';
 	return strcmp(str, last);//0 if they are the same
 }
 
@@ -184,14 +195,12 @@ void setroot()
 {
 	if (!getstatus(statusstr[0], statusstr[1]))//Only set root if text has changed.
 		return;
-	Display *d = XOpenDisplay(NULL);
-	if (d) {
-		dpy = d;
-	}
-	screen = DefaultScreen(dpy);
-	root = RootWindow(dpy, screen);
+	// The connection is opened once in main() and kept for the life of the
+	// process. Reconnecting on every update meant a full X handshake every
+	// time any block ticked, and left dpy dangling whenever XOpenDisplay
+	// failed, since the previous display had already been closed.
 	XStoreName(dpy, root, statusstr[0]);
-	XCloseDisplay(dpy);
+	XFlush(dpy);
 }
 
 void pstdout()
@@ -268,20 +277,27 @@ void sighandler()
 
 void buttonhandler(int ssi_int)
 {
-	char button[2] = {'0' + ssi_int & 0xff, '\0'};
+	// '+' binds tighter than '&', so this was ('0' + ssi_int) & 0xff, which
+	// only happened to give the right digit for the button numbers in use.
+	char button[2] = {'0' + (ssi_int & 0xff), '\0'};
 	pid_t process_id = getpid();
 	int sig = ssi_int >> 8;
 	if (fork() == 0)
 	{
-		const Block *current;
+		const Block *current = NULL;
 		for (int i = 0; i < LENGTH(blocks); i++)
 		{
-			current = blocks + i;
-			if (current->signal == sig)
+			if (blocks[i].signal == sig) {
+				current = blocks + i;
 				break;
+			}
 		}
+		// A signal with no matching block used to leave current pointing at
+		// the last block, and the click ran that block's command instead.
+		if (!current)
+			exit(EXIT_SUCCESS);
 		char shcmd[1024];
-		sprintf(shcmd,"%s && kill -%d %d",current->command, current->signal+34,process_id);
+		snprintf(shcmd,sizeof shcmd,"%s && kill -%d %d",current->command, current->signal+34,process_id);
 		char *command[] = { "/bin/sh", "-c", shcmd, NULL };
 		setenv("BLOCK_BUTTON", button, 1);
 		setsid();
@@ -305,8 +321,20 @@ int main(int argc, char** argv)
 		else if(!strcmp("-p",argv[i]))
 			writestatus = pstdout;
 	}
+	// Only the root-window writer needs X; -p just prints to stdout.
+	if (writestatus == setroot) {
+		if (!(dpy = XOpenDisplay(NULL))) {
+			fprintf(stderr, "dwmblocks: cannot open display\n");
+			return 1;
+		}
+		screen = DefaultScreen(dpy);
+		root = RootWindow(dpy, screen);
+	}
 	signal(SIGTERM, termhandler);
 	signal(SIGINT, termhandler);
 	statusloop();
 	close(signalFD);
+	if (dpy)
+		XCloseDisplay(dpy);
+	return 0;
 }
