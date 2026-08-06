@@ -6,8 +6,10 @@
 #include <signal.h>
 #include <errno.h>
 #include <X11/Xlib.h>
+#ifdef __linux__
 #include <sys/signalfd.h>
 #include <poll.h>
+#endif /* __linux__ */
 #define LENGTH(X) (sizeof(X) / sizeof (X[0]))
 #define CMDLENGTH		50
 
@@ -17,7 +19,7 @@ typedef struct {
 	unsigned int interval;
 	unsigned int signal;
 } Block;
-void sighandler();
+void handlesignal(int signum, int sigval);
 void buttonhandler(int ssi_int);
 void replace(char *str, char old, char new);
 void remove_all(char *str, char to_remove);
@@ -38,7 +40,12 @@ static Window root;
 static char statusbar[LENGTH(blocks)][CMDLENGTH] = {0};
 static char statusstr[2][256];
 static int statusContinue = 1;
+#ifdef __linux__
 static int signalFD;
+#endif /* __linux__ */
+// The set of signals the status bar waits on. On Linux it is only needed to
+// set up the signal file descriptor; elsewhere the wait loop reads from it.
+static sigset_t signals;
 static int timerInterval = -1;
 static void (*writestatus) () = setroot;
 
@@ -145,7 +152,6 @@ void getsigcmds(int signal)
 
 void setupsignals()
 {
-	sigset_t signals;
 	sigemptyset(&signals);
 	sigaddset(&signals, SIGALRM); // Timer events
 	sigaddset(&signals, SIGUSR1); // Button events
@@ -153,8 +159,10 @@ void setupsignals()
 	for (size_t i = 0; i < LENGTH(blocks); i++)
 		if (blocks[i].signal > 0)
 			sigaddset(&signals, SIGRTMIN + blocks[i].signal);
+#ifdef __linux__
 	// Create signal file descriptor for pooling
 	signalFD = signalfd(-1, &signals, 0);
+#endif /* __linux__ */
 	// Block all real-time signals
 	for (int i = SIGRTMIN; i <= SIGRTMAX; i++) sigaddset(&signals, i);
 	sigprocmask(SIG_BLOCK, &signals, NULL);
@@ -185,9 +193,16 @@ void setroot()
 	if (!getstatus(statusstr[0], statusstr[1]))//Only set root if text has changed.
 		return;
 	Display *d = XOpenDisplay(NULL);
-	if (d) {
-		dpy = d;
+	if (!d) {
+		// Started outside X, or the server has gone away. Everything below
+		// dereferences the Display, so carrying on here is a segfault - and
+		// there is nothing to write a status to, so stop.
+		fprintf(stderr, "dwmblocks: cannot open display \"%s\"\n",
+				getenv("DISPLAY") ? getenv("DISPLAY") : "");
+		statusContinue = 0;
+		return;
 	}
+	dpy = d;
 	screen = DefaultScreen(dpy);
 	root = RootWindow(dpy, screen);
 	XStoreName(dpy, root, statusstr[0]);
@@ -214,6 +229,7 @@ void statusloop()
         }
     }
     getcmds(-1);     // Fist time run all commands
+#ifdef __linux__
     if (signalFD < 0) {
         fprintf(stderr, "dwmblocks: cannot create signal file descriptor: %s\n",
                 strerror(errno));
@@ -236,17 +252,36 @@ void statusloop()
             break;
         if (!(pfd[0].revents & POLLIN))
             continue;
-        sighandler(); // Handle signal
+        // Handle signal
+        struct signalfd_siginfo si;
+        if (read(signalFD, &si, sizeof(si)) < 0)
+            continue;
+        handlesignal(si.ssi_signo, si.ssi_int);
     }
+#else
+    // There is no signalfd(2) outside Linux. sigwaitinfo(2) waits on the same
+    // blocked set and, unlike a kqueue EVFILT_SIGNAL, still hands back the
+    // siginfo_t: the button handler needs the value dwm queues with the
+    // signal to know which mouse button was clicked.
+    raise(SIGALRM);  // Schedule first timer event
+    siginfo_t si;
+    while (statusContinue) {
+        if (sigwaitinfo(&signals, &si) < 0) {
+            // An interrupted wait is not a reason to stop the status bar.
+            if (errno == EINTR)
+                continue;
+            fprintf(stderr, "dwmblocks: sigwaitinfo failed: %s\n",
+                    strerror(errno));
+            break;
+        }
+        handlesignal(si.si_signo, si.si_value.sival_int);
+    }
+#endif /* __linux__ */
 }
 
-void sighandler()
+void handlesignal(int signal, int sigval)
 {
 	static int time = 0;
-	struct signalfd_siginfo si;
-	int ret = read(signalFD, &si, sizeof(si));
-	if (ret < 0) return;
-	int signal = si.ssi_signo;
 	switch (signal) {
 		case SIGALRM:
 			// Execute blocks and schedule the next timer event
@@ -256,7 +291,7 @@ void sighandler()
 			break;
 		case SIGUSR1:
 			// Handle buttons
-			buttonhandler(si.ssi_int);
+			buttonhandler(sigval);
 			return;
 		default:
 			// Execute the block that has the given signal
@@ -281,7 +316,9 @@ void buttonhandler(int ssi_int)
 				break;
 		}
 		char shcmd[1024];
-		sprintf(shcmd,"%s && kill -%d %d",current->command, current->signal+34,process_id);
+		// Signal the bar back with the real SIGRTMIN of this system rather
+		// than Linux's 34: on FreeBSD the real-time signals start at 65.
+		sprintf(shcmd,"%s && kill -%d %d",current->command, current->signal+SIGRTMIN,process_id);
 		char *command[] = { "/bin/sh", "-c", shcmd, NULL };
 		setenv("BLOCK_BUTTON", button, 1);
 		setsid();
@@ -308,5 +345,7 @@ int main(int argc, char** argv)
 	signal(SIGTERM, termhandler);
 	signal(SIGINT, termhandler);
 	statusloop();
+#ifdef __linux__
 	close(signalFD);
+#endif /* __linux__ */
 }
